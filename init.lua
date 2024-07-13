@@ -32,6 +32,10 @@ SpaceMan.settingsKey = "SpaceManSpaces"
 --- via hs.settings
 SpaceMan.focusedSettingsKey = "SpaceManFocusedSpace"
 
+SpaceMan.windowSpaceMapKey = "SpaceManWindowSpaceMap"
+SpaceMan.spaceWindowsKey = "SpaceManSpaceWindows"
+SpaceMan.hiddenWindowPositionsKey = "SpaceManHiddenWindowPositions"
+
 --- SpaceMan.menuBarAutosaveName
 --- Constant
 --- Autosave name used with macOS to save menu bar item position.
@@ -72,8 +76,6 @@ SpaceMan.spaceWindows = nil
 
 SpaceMan.hiddenWindowPositions = nil
 
-SpaceMan.windowCache = nil
-
 --- SpaceMan.spaceChooser
 --- Variable
 --- hs.chooser object representing the Space chooser.
@@ -109,15 +111,45 @@ SpaceMan.windowSpaces = function(window)
 end
 
 function SpaceMan:moveWindowToVirtualSpace(window, spaceID)
-    self:removeWindowFromVirtualSpace(window, spaceID)
-    return self:addWindowToVirtualSpace(window, spaceID)
+    -- This needs to emulate hs.spaces.moveWindowToSpace, which differs in the
+    -- sense that it in Mission Control the actual behavior is that the window is
+    -- exclusively assigned to the space it is being moved to. So this actually
+    -- adds the window to the provided spaceID and removes it from all others it
+    -- is present in.
+
+    local windowSpaces = self:getVirtualSpacesForWindow(window)
+    local windowInSpace = false
+    for _, windowSpaceID in pairs(windowSpaces) do
+        if windowSpaceID ~= spaceID then
+            self:removeWindowFromVirtualSpace(window, windowSpaceID)
+        else
+            windowInSpace = true
+        end
+    end
+
+    if not windowInSpace then
+        self:addWindowToVirtualSpace(window, spaceID)
+    else
+        self.logger.vf("Window %s already visible and in current space", window)
+    end
 end
 
 function SpaceMan:addWindowToVirtualSpace(window, spaceID)
     if not spaceID then spaceID = self.currentlyFocusedSpace end
+    self.logger.vf("No space ID provided, using current space %s",
+                   self.currentlyFocusedSpace)
+
+    self.logger.vf("Adding window %s to space %s", hs.inspect(window), spaceID)
+
+    if not self.virtualSpaces[spaceID] then
+        self.logger.ef("Space with ID %s does not exist", spaceID)
+        return nil
+    end
 
     local windowID = nil
     if type(window) == "number" then
+        self.logger.vf("Resolved window %s for ID %s", hs.inspect(window),
+                       windowID)
         window = WindowCache:getWindowByID(window)
     end
 
@@ -137,12 +169,29 @@ function SpaceMan:addWindowToVirtualSpace(window, spaceID)
         self.spaceWindows[spaceID] = spaceWindows
     end
 
-    spaceWindows[windowID] = window
+    spaceWindows[windowID] = windowID
+
+    -- Restore the window.
+    if spaceID == self.currentlyFocusedSpace and not self:windowVisible(window) then
+        self.logger.vf(
+            "Window %s added to current space and not visible, restoring.",
+            windowID)
+        self:restoreWindow(window)
+    end
+
+    self:_writeSpaceAssignments()
 
     return self:getVirtualSpacesForWindow(windowID)
 end
 
 function SpaceMan:removeWindowFromVirtualSpace(window, spaceID, destroyed)
+    if not spaceID then spaceID = self.currentlyFocusedSpace end
+    self.logger.vf("No space ID provided, using current space %s",
+                   self.currentlyFocusedSpace)
+
+    self.logger.vf("Removing window %s from space %s", hs.inspect(window),
+                   spaceID)
+
     local windowID = nil
     if type(window) == "number" then
         windowID = window
@@ -164,6 +213,7 @@ function SpaceMan:removeWindowFromVirtualSpace(window, spaceID, destroyed)
     windowSpaceIDs[spaceID] = nil
     if next(windowSpaceIDs) == nil then
         if destroyed then
+            self.logger.vf("Window %s destroyed, clearing space map", windowID)
             -- Window is destroyed, remove space map entirely.
             self.windowSpaceMap[windowID] = nil
         else
@@ -175,6 +225,14 @@ function SpaceMan:removeWindowFromVirtualSpace(window, spaceID, destroyed)
             self:addWindowToVirtualSpace(windowID)
         end
     end
+
+    if spaceID == self.currentlyFocusedSpace and self:windowVisible(window) then
+        self.logger.vf(
+            "Window %s removed from current space and visible, hiding", windowID)
+        self:hideWindow(window)
+    end
+
+    self:_writeSpaceAssignments()
 end
 
 function SpaceMan:hideSpace(spaceID)
@@ -185,6 +243,8 @@ function SpaceMan:hideSpace(spaceID)
     end
 
     for _, window in pairs(spaceWindows) do self:hideWindow(window) end
+
+    self:_writeWindowStates()
 end
 
 function SpaceMan:restoreSpace(spaceID)
@@ -195,13 +255,42 @@ function SpaceMan:restoreSpace(spaceID)
     end
 
     for _, window in pairs(spaceWindows) do self:restoreWindow(window) end
+
+    self:_writeWindowStates()
 end
 
 function SpaceMan:goToSpace(spaceID)
+    if spaceID == self.currentlyFocusedSpace then
+        self.logger.vf("Space with ID %s is already focused", spaceID)
+        return
+    end
+
     self:hideSpace(self.currentlyFocusedSpace)
     self:restoreSpace(spaceID)
 
     self.currentlyFocusedSpace = spaceID
+    self:_setMenuText()
+end
+
+function SpaceMan:windowVisible(window)
+    if type(window) == "number" then
+        window = WindowCache:getWindowByID(window)
+    end
+
+    return self.hiddenWindowPositions[window:id()] == nil
+end
+
+function SpaceMan:windowInSpace(window, spaceID)
+    if type(window) ~= "number" then window = window:id() end
+
+    local windowSpaces = self.windowSpaceMap[window]
+    if not windowSpaces then return false end
+
+    if windowSpaces[spaceID] == true then
+        return true
+    else
+        return false
+    end
 end
 
 function SpaceMan:hideWindow(window)
@@ -340,6 +429,8 @@ function SpaceMan:renameVirtualSpace(spaceID, newSpaceID)
     end
 
     self:_writeSpaceNames()
+    self:_writeSpaceAssignments()
+    self:_setMenuText()
 end
 
 function SpaceMan:removeVirtualSpace(spaceID)
@@ -374,6 +465,9 @@ function SpaceMan:removeVirtualSpace(spaceID)
             self:addWindowToVirtualSpace(window)
         end
     end
+
+    self:_writeSpaceNames()
+    self:_writeSpaceAssignments()
 end
 
 -- Handler for creating the SpaceMan menu bar menu.
@@ -415,47 +509,50 @@ function SpaceMan:_renameSpace(spacePos, name)
     self:_writeSpaceNames()
 end
 
+function SpaceMan:_writeSetting(name, value)
+    self.logger.vf("Writing value to hs.settings with key %s: %s", name,
+                   hs.inspect(value))
+    hs.settings.set(name, value)
+end
+
 -- Persist the current ordered set of space IDs back to hs.settings.
 function SpaceMan:_writeSpaceNames()
-    self.logger.vf("Writing space IDs to hs.settings at %s: %s",
-                   self.settingsKey, hs.inspect(self.orderedSpaces))
-    hs.settings.set(self.settingsKey, self.orderedSpaces)
+    self:_writeSetting(self.settingsKey, self.orderedSpaces)
 end
 
 -- Persist the currently focused space name back to hs.settings.
 function SpaceMan:_writeFocusedSpace()
-    self.logger.vf(
-        "Writing currently focused space name to hs.settings at %s: %s",
-        self.focusedSettingsKey, hs.inspect(self.currentlyFocusedSpace))
-    hs.settings.set(self.focusedSettingsKey, self.currentlyFocusedSpace)
+    self:_writeSetting(self.focusedSettingsKey, self.currentlyFocusedSpace)
 end
 
--- Retrieve the "name" of a fullscreen space.
--- This trudges through the internal data_managedDisplaySpaces structure to locate
--- and set the name of a fullscreen space, which is the app name of the first
--- "tile" in a tiled space.
-function SpaceMan:_getFullScreenSpaceName(spaceID)
-    spaceData = hs.spaces.data_managedDisplaySpaces()
+function SpaceMan:_writeSpaceAssignments()
+    -- self:_writeSetting(self.spaceWindowsKey, self.spaceWindows)
+    -- self:_writeSetting(self.windowSpaceMapKey, self.windowSpaceMap)
+    return
+end
 
-    screenUUID = hs.screen.mainScreen():getUUID()
+function SpaceMan:_writeWindowStates()
+    -- self:_writeSetting(self.hiddenWindowPositionsKey, self.hiddenWindowPositions)
+    return
+end
 
-    for _, displaySpaces in ipairs(spaceData) do
-        -- Find spaces for this screen.
-        if displaySpaces["Display Identifier"] == screenUUID then
-            for _, space in ipairs(displaySpaces["Spaces"]) do
-                -- Find the space with this ID.
-                if space["ManagedSpaceID"] == spaceID then
-                    -- Retrieve and return tiled app name.
-                    return
-                        space["TileLayoutManager"]["TileSpaces"][1]["appName"] ..
-                            " (F)"
-                end
-            end
-        end
+function SpaceMan:_loadSetting(name, default)
+    self.logger.vf("Loading spaces from hs.settings key: \"%s\"",
+                   self.settingsKey)
+
+    local settingVal = hs.settings.get(name)
+
+    if not settingVal then
+        -- Default to empty table.
+        self.logger.vf("No saved value for key %s, using default: %s", name,
+                       hs.inspect(default))
+        return default
     end
 
-    -- Could not find name.
-    return nil
+    self.logger.vf("Loaded saved value for key %s: %s", name,
+                   hs.inspect(settingVal))
+
+    return settingVal
 end
 
 -- Perform an initial load of all space IDs and names. This will retrieve the
@@ -465,17 +562,9 @@ end
 -- be called once on startup, and then _reloadSpaceNames is used to reconcile
 -- the in-memory state during Spacer related events.
 function SpaceMan:_loadSpaceNames()
-    self.logger.vf("Loading spaces from hs.settings key \"%s\"",
-                   self.settingsKey)
-
     -- Load the persisted space names from the previous session if any.
-    local orderedSpaces = hs.settings.get(self.settingsKey)
-
-    if not orderedSpaces then
-        -- Default to empty table.
-        self.logger.v("No saved space names, initializing empty table")
-        orderedSpaces = {"None"}
-    end
+    -- Default to empty table.
+    local orderedSpaces = self:_loadSetting(self.settingsKey, {"None"})
 
     for _, spaceID in ipairs(orderedSpaces) do
         self:createVirtualSpace(spaceID, true)
@@ -485,21 +574,60 @@ function SpaceMan:_loadSpaceNames()
 end
 
 function SpaceMan:_loadFocusedSpace()
-    self.logger.vf("Loading focused space from hs.settings key \"%s\"",
-                   self.focusedSettingsKey)
-
     -- Load the persisted space names from the previous session if any.
-    self.currentlyFocusedSpace = hs.settings.get(self.focusedSettingsKey)
+    -- Default to first Space.
+    self.currentlyFocusedSpace = self:_loadSetting(self.focusedSettingsKey,
+                                                   self.orderedSpaces[1])
+end
 
-    if self.currentlyFocusedSpace == nil then
-        -- Default to first Space.
+function SpaceMan:_loadSpaceAssignments()
+    -- self.spaceWindows = self:_loadSetting(self.spaceWindowsKey, {})
+    -- self.windowSpaceMap = self:_loadSetting(self.windowSpaceMapKey, {})
+    return
+end
 
-        self.logger.v("No saved focused space, defaulting to first space")
-        self.currentlyFocusedSpace = self.orderedSpaces[1]
+function SpaceMan:_loadWindowStates()
+    -- self.hiddenWindowPositions = self:_loadSetting(
+    --                                  self.hiddenWindowPositionsKey, {})
+    return
+end
+
+function SpaceMan:runCommand(command)
+    self.logger.vf("Handling SpaceMan command %s", command)
+
+    local command_split = hs.fnutils.split(command, " ", 1)
+
+    -- Command index
+    -- In all commands, window refers to the window that was focused prior to
+    -- bringing up the chooser, and space refers to either a space ID or the
+    -- ordinal position of a space.
+    -- mv {space} - Move window to space.
+    -- add {space} - Add window to space.
+    -- rm {space} - Remove window from space.
+    -- mvs {left/right} {space} - Move space to the left or right of given space.
+    -- rms {space} - Delete space.
+    -- mks {space} - Add new space.
+    -- ren {space} - Rename current space to provided space name.
+    local command = command_split[1]
+    local args = command_split[2]
+    if command == "mv" then
+        self:moveWindowToVirtualSpace(hs.window.frontmostWindow(), args)
+    elseif command == "add" then
+        self:addWindowToVirtualSpace(hs.window.frontmostWindow(), args)
+    elseif command == "rm" then
+        self:removeWindowFromVirtualSpace(hs.window.frontmostWindow(), args)
+    elseif command == "rms" then
+        self:removeVirtualSpace(args)
+    elseif command == "mks" then
+        self:createVirtualSpace(args)
+    elseif command == "ren" then
+        self:renameVirtualSpace(self.currentlyFocusedSpace, args)
+    elseif command == mvs then
+        -- TODO: Implement, needs extra argument.
+        self.logger.e("unimplemented")
+    else
+        self.logger.i("Unknown command, ignoring")
     end
-
-    self.logger.vf("Loaded currently focused space: %s",
-                   hs.inspect(self.currentlyFocusedSpace))
 end
 
 -- Choice generator for Spacer Chooser.
@@ -525,9 +653,19 @@ end
 -- Input is the table representing the choice from the Chooser.
 function SpaceMan:_spaceChooserCompletion(choice)
     if choice == nil then
+        -- User closed the Chooser without making a choice.
         self.logger.vf("No choice made, skipping")
         return
+    elseif not choice.spaceID then
+        -- User entered text that does not match any space name, execute as command.
+        -- The input is still a choice table, it just doesn't have a spaceID set
+        -- because it didn't originate from _spaceChooserChoices.
+        self.logger.vf("Input is a SpaceMan command, executing")
+
+        self:runCommand(choice.text)
+        return
     elseif choice.spaceID == self.currentlyFocusedSpace then
+        --- User selected the currently focused space, skip.
         self.logger.vf("Choice is currently focused space, skipping")
         return
     end
@@ -593,6 +731,9 @@ function SpaceMan:start()
     -- Load the currently focused space, if any.
     self:_loadFocusedSpace()
 
+    self:_loadSpaceAssignments()
+    self:_loadWindowStates()
+
     self.logger.v("Creating menubar item")
     self.menuBar = hs.menubar.new()
     self.menuBar:autosaveName(self.menuBarAutosaveName)
@@ -602,6 +743,10 @@ function SpaceMan:start()
     self.logger.v("Creating space chooser")
     self.spaceChooser = hs.chooser.new(self:_instanceCallback(
                                            self._spaceChooserCompletion))
+    -- If the input does not match any space name, the callback will be executed
+    -- with a choice table where choice.text is equal to the input, this is used
+    -- for execution of SpaceMan control commands.
+    self.spaceChooser:enableDefaultForQuery(true)
     self.spaceChooser:choices(self:_instanceCallback(self._spaceChooserChoices))
 
     -- Perform an initial text set for the current space.
@@ -626,6 +771,9 @@ function SpaceMan:stop()
 
     -- Write the currently focused space back to settings.
     self:_writeFocusedSpace()
+
+    self:_writeSpaceAssignments()
+    self:_writeWindowStates()
 
     self.logger.v("Deleting space chooser")
     self.spaceChooser:delete()
